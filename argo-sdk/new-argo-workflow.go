@@ -27,7 +27,7 @@ func main() {
 	// 提交工作流
 	workflowClient := client.NewWorkflowServiceClient()
 	createdWf, err := workflowClient.CreateWorkflow(ctx, &workflowpkg.WorkflowCreateRequest{
-		Namespace: "argo",
+		Namespace: "default",
 		Workflow:  workflow,
 	})
 

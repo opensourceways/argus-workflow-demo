@@ -1,0 +1,100 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemp
+metadata:
+  name: linux-arm64-npu-1
+  namespace: argo
+spec:
+  imagePullSecrets:
+  - name: huawei-swr-image-pull-secret-model-gy
+  schedulerName: volcano
+  artifactRepositoryRef:
+    configMap: workflow-artifact-repository
+    key: artifact-repository
+  archiveLogs: true
+  volumeClaimTemplates:
+  - metadata:
+      name: workspace
+    spec:
+      accessModes: ["ReadWriteMany"]
+      storageClassName: sfsturbo-subpath-sc
+      resources:
+        requests:
+          storage: 1Gi
+  volumes:
+    - name: driver-tools
+      hostPath:
+        path: /usr/local/Ascend/driver/tools
+        type: ""
+  entrypoint: linux-arm64-npu-1
+  arguments:
+    parameters:
+    - name: repo-url
+      value: "https://gitcode.com/jl-brother1/test.git"
+    - name: revision
+      value: "main"
+    - name: build-command
+      value: "npu-smi info"
+    - name: custom-image
+      value: "swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1-910b-ubuntu22.04-py3.11"
+
+  templates:
+  - name: linux-arm64-npu-1
+    steps:
+    - - name: checkout
+        template: checkout
+        arguments: # 添加arguments块传递参数
+          parameters:
+          - name: repo-url
+            value: "{{workflow.parameters.repo-url}}"
+          - name: revision
+            value: "{{workflow.parameters.revision}}"
+    - - name: execute
+        template: execute
+        arguments:
+          parameters:
+          - name: build-command
+            value: "{{workflow.parameters.build-command}}"
+          - name: custom-image
+            value: "{{workflow.parameters.custom-image}}"
+
+  - name: checkout
+    inputs:
+      parameters:
+      - name: repo-url
+      - name: revision
+    script:
+      image: swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/git:latest
+      command: [sh]
+      source: |
+        git clone {{inputs.parameters.repo-url}} /workspace/source
+        cd /workspace/source
+        git checkout {{inputs.parameters.revision}}
+      volumeMounts:
+      - name: workspace
+        mountPath: /workspace
+
+  - name: execute
+    inputs:
+      parameters:
+      - name: build-command
+      - name: custom-image
+    container:
+      image: "{{inputs.parameters.custom-image}}"
+      resources:
+        limits:
+          cpu: "24"
+          huawei.com/ascend-1980: "1"
+          memory: 128Gi
+        requests:
+          cpu: "24"
+          huawei.com/ascend-1980: "1"
+          memory: 128Gi
+      workingDir: /workspace/source
+      command: [sh, -c]
+      args: ["{{inputs.parameters.build-command}}"]
+      volumeMounts:
+      - name: workspace
+        mountPath: /workspace
+      - name: driver-tools
+        mountPath: /usr/local/Ascend/driver/tools
+        readOnly: true

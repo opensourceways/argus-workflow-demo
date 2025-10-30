@@ -70,7 +70,7 @@ jobs:
  
 // 从文件解析工作流
 func parseFromFile() {
-	file, err := os.Open(".github/workflows/ci.yml")
+	file, err := os.Open(".argus/workflows/ci.yml")
 	if err != nil {
 		log.Printf("无法打开文件 (跳过): %v", err)
 		return
@@ -93,7 +93,7 @@ func parseFromFile() {
  
 // 从目录解析所有工作流
 func parseFromDirectory() {
-	workflowDir := ".github/workflows"
+	workflowDir := ".argus/workflows"
 	
 	// 检查目录是否存在
 	if _, err := os.Stat(workflowDir); os.IsNotExist(err) {

@@ -1,0 +1,91 @@
+name: 'e2e test'
+
+on:
+  workflow_dispatch:
+
+
+jobs:
+  e2e:
+    name: singlecard
+    runs-on: linux-aarch64-a2-1
+    container:
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1-910b-ubuntu22.04-py3.11
+      env:
+        VLLM_LOGGING_LEVEL: ERROR
+        VLLM_USE_MODELSCOPE: True
+    steps:
+      - name: Check npu and CANN info
+        run: |
+          npu-smi info
+          cat /usr/local/Ascend/ascend-toolkit/latest/"$(uname -i)"-linux/ascend_toolkit_install.info
+
+      - name: Config mirrors
+        run: |
+          sed -Ei 's@(ports|archive).ubuntu.com@cache-service.nginx-pypi-cache.svc.cluster.local:8081@g' /etc/apt/sources.list
+          pip config set global.index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
+          pip config set global.trusted-host cache-service.nginx-pypi-cache.svc.cluster.local
+          apt-get update -y
+          apt install git -y
+
+      - name: Checkout vllm-project/vllm-ascend repo
+        uses: actions/checkout@v4
+        with:
+            repository: vllm-project/vllm-ascend
+            ref: main
+            path: ./
+            fetch-depth: 1
+
+      - name: Install system dependencies
+        run: |
+          apt-get -y install `cat packages.txt`
+          apt-get -y install gcc g++ cmake libnuma-dev
+
+      - name: Checkout vllm-project/vllm repo
+        uses: actions/checkout@v4
+        with:
+          repository: vllm-project/vllm
+          ref: v0.11.0
+          path: ./vllm-empty
+          fetch-depth: 1
+
+      - name: Install vllm-project/vllm from source
+        working-directory: ./vllm-empty
+        run: |
+          sleep 36000
+          cd ./vllm-empty
+          VLLM_TARGET_DEVICE=empty pip install -e .
+
+      - name: Install vllm-project/vllm-ascend
+        env:
+          PIP_EXTRA_INDEX_URL: https://mirrors.huaweicloud.com/ascend/repos/pypi
+        run: |
+          export PIP_EXTRA_INDEX_URL=https://mirrors.huaweicloud.com/ascend/repos/pypi
+          cd ./vllm-ascend
+          pip install -r requirements-dev.txt
+          pip install -v -e .
+
+      - name: Run vllm-project/vllm-ascend test
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          VLLM_USE_MODELSCOPE: True
+          PYTORCH_NPU_ALLOC_CONF: max_split_size_mb:256
+        run: |
+          pytest -sv tests/e2e/singlecard/test_sampler.py
+          #pytest -sv tests/e2e/singlecard/test_quantization.py
+          #pytest -sv tests/e2e/singlecard/test_vlm.py::test_multimodal_vl
+
+      - name: Run e2e test
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          VLLM_USE_MODELSCOPE: True
+          PYTORCH_NPU_ALLOC_CONF: max_split_size_mb:256
+        if: ${{ inputs.type == 'full' }}
+        run: |
+          # We found that if running aclgraph tests in batch, it will cause AclmdlRICaptureBegin error. So we run
+          # the test separately.
+
+          #pytest -sv tests/e2e/singlecard/test_aclgraph.py
+          #pytest -sv tests/e2e/singlecard/test_ascend_scheduler.py
+          #pytest -sv tests/e2e/singlecard/test_bge_model.py
+          pytest -sv tests/e2e/singlecard/test_camem.py
+          #pytest -sv tests/e2e/singlecard/test_chunked.py

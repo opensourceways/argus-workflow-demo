@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,21 +11,21 @@ import (
 	"sync"
 
 	// 1. Argo Workflow API 结构体
-	wfv1alpha1 "github.com/argoproj/argo-workflows/v3/pkg/apis/workflow/v1alpha1"
+	wfv1 "github.com/argoproj/argo-workflows/v3/pkg/apis/workflow/v1alpha1"
+	corev1 "k8s.io/api/core/v1"
 
 	// 2. nektos/act GHA 解析器
 	"github.com/nektos/act/pkg/model"
 
 	"github.com/google/uuid"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
 	"gopkg.in/yaml.v3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // --- 线程池（Worker Pool）配置 ---
 
 const (
-	NumWorkers = 5  // 工作 Goroutine 的数量
+	NumWorkers = 5   // 工作 Goroutine 的数量
 	MaxQueue   = 100 // 作业队列的最大缓冲
 )
 
@@ -140,8 +139,8 @@ func handleConvert(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
 		json.NewEncoder(w).Encode(map[string]string{
-			"status":  "processing",
-			"jobID":   jobID,
+			"status":    "processing",
+			"jobID":     jobID,
 			"resultURL": fmt.Sprintf("/result/%s", jobID),
 		})
 	default:
@@ -170,7 +169,7 @@ func handleGetResult(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
 		json.NewEncoder(w).Encode(map[string]string{
-			"status": "not_found",
+			"status":  "not_found",
 			"message": "Job not found or still processing",
 		})
 		return
@@ -194,17 +193,16 @@ func handleGetResult(w http.ResponseWriter, r *http.Request) {
 // --- 核心转换逻辑 ---
 
 // convertGHAtoArgo 使用 nektos/act 解析器执行转换
-func convertGHAtoArgo(ghaYAML string) (*wfv1alpha1.Workflow, error) {
+func convertGHAtoArgo(ghaYAML string) (*wfv1.Workflow, error) {
 	// 1. 使用 nektos/act/pkg/model 解析 GHA YAML
-	// model.ReadWorkflow 需要一个 io.Reader
 	ghaReader := strings.NewReader(ghaYAML)
-	ghaWF, err := model.ReadWorkflow(ghaReader)
+	ghaWF, err := model.ReadWorkflow(ghaReader, false) // 添加第二个参数 false
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse GHA YAML using 'act': %v", err)
 	}
 
 	// 2. 创建 Argo Workflow 基础结构
-	argoWF := &wfv1alpha1.Workflow{
+	argoWF := &wfv1.Workflow{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "argoproj.io/v1alpha1",
 			Kind:       "Workflow",
@@ -212,29 +210,32 @@ func convertGHAtoArgo(ghaYAML string) (*wfv1alpha1.Workflow, error) {
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: sanitizeName(ghaWF.Name) + "-",
 		},
-		Spec: wfv1alpha1.WorkflowSpec{
-			Templates: []wfv1alpha1.Template{},
+		Spec: wfv1.WorkflowSpec{
+			Templates: []wfv1.Template{},
 		},
 	}
 
 	// 3. 编排 Job (GHA Job -> Argo DAG Task)
 	var jobNames []string
-	jobTemplates := make(map[string]wfv1alpha1.Template)
+	jobTemplates := make(map[string]wfv1.Template)
 	jobDependencies := make(map[string][]string)
 
 	for jobName, ghaJob := range ghaWF.Jobs {
 		jobTemplateName := sanitizeName(jobName)
 		jobNames = append(jobNames, jobTemplateName)
-		jobDependencies[jobTemplateName] = ghaJob.Needs // 记录依赖
+
+		// 修复：调用 Needs() 方法而不是直接访问字段
+		needs := ghaJob.Needs()
+		jobDependencies[jobTemplateName] = needs // 记录依赖
 
 		// 为 GHA Job 创建一个 Argo "steps" 模板
-		jobTemplate := wfv1alpha1.Template{
+		jobTemplate := wfv1.Template{
 			Name:  jobTemplateName,
-			Steps: [][]wfv1alpha1.WorkflowStep{}, // 顺序执行
+			Steps: []wfv1.ParallelSteps{}, // 修复：使用正确的类型
 		}
 
 		// GHA 步骤 -> Argo 模板
-		var stepTemplates []wfv1alpha1.Template
+		var stepTemplates []wfv1.Template
 
 		for i, ghaStep := range ghaJob.Steps {
 			stepName := sanitizeName(ghaStep.Name)
@@ -244,7 +245,7 @@ func convertGHAtoArgo(ghaYAML string) (*wfv1alpha1.Workflow, error) {
 			stepTemplateName := fmt.Sprintf("%s-%s", jobTemplateName, stepName)
 
 			// a. 将 GHA step 添加到 Job 的 "steps" 序列中
-			jobTemplate.Steps = append(jobTemplate.Steps, []wfv1alpha1.WorkflowStep{
+			jobTemplate.Steps = append(jobTemplate.Steps, wfv1.ParallelSteps{
 				{
 					Name:     stepName,
 					Template: stepTemplateName,
@@ -252,33 +253,40 @@ func convertGHAtoArgo(ghaYAML string) (*wfv1alpha1.Workflow, error) {
 			})
 
 			// b. 创建 GHA step 对应的 Argo Template
-			baseImage := mapRunsOnToImage(ghaJob.RunsOn)
-			stepTemplate := wfv1alpha1.Template{
+			// 修复：调用 RunsOn() 方法并获取第一个运行环境
+			runsOn := ghaJob.RunsOn()
+			var baseImage string
+			if len(runsOn) > 0 {
+				baseImage = mapRunsOnToImage(runsOn[0])
+			} else {
+				baseImage = "alpine:latest"
+			}
+
+			stepTemplate := wfv1.Template{
 				Name: stepTemplateName,
 			}
 
 			if ghaStep.Run != "" {
 				// 转换 GHA 'run' -> Argo 'script'
-				stepTemplate.Script = &wfv1alpha1.ScriptTemplate{
-					Container: wfv1alpha1.Container{
-						Image: baseImage,
+				stepTemplate.Script = &wfv1.ScriptTemplate{
+					Container: corev1.Container{ // 修复：使用 corev1.Container
+						Image:   baseImage,
+						Command: []string{"bash", "-c"}, // GHA 默认使用 bash
 					},
-					Command: []string{"bash", "-c"}, // GHA 默认使用 bash
-					Source:  ghaStep.Run,
+					Source: ghaStep.Run,
 				}
 			} else if ghaStep.Uses != "" {
 				// 转换 GHA 'uses' -> 占位符 (Placeholder)
-				// 这是必须手动替换的地方
 				withParams := ""
 				if ghaStep.With != nil {
 					withParams = fmt.Sprintf("Parameters (with): %v", ghaStep.With)
 				}
 
-				stepTemplate.Script = &wfv1alpha1.ScriptTemplate{
-					Container: wfv1alpha1.Container{
-						Image: "alpine:latest",
+				stepTemplate.Script = &wfv1.ScriptTemplate{
+					Container: corev1.Container{ // 修复：使用 corev1.Container
+						Image:   "alpine:latest",
+						Command: []string{"sh", "-c"},
 					},
-					Command: []string{"sh", "-c"},
 					Source: fmt.Sprintf(`
 echo "****************************************************************"
 echo "TODO: Manually implement GHA Action: %s"
@@ -306,12 +314,12 @@ exit 1
 		argoWF.Spec.Entrypoint = jobNames[0]
 	} else {
 		// 多 Job 工作流：创建一个 DAG (有向无环图)
-		dagTemplate := wfv1alpha1.Template{
+		dagTemplate := wfv1.Template{
 			Name: "main-dag",
-			DAG:  &wfv1alpha1.DAGTemplate{},
+			DAG:  &wfv1.DAGTemplate{},
 		}
 		for _, jobTplName := range jobNames {
-			dagTask := wfv1alpha1.DAGTask{
+			dagTask := wfv1.DAGTask{
 				Name:     jobTplName,
 				Template: jobTplName,
 			}
@@ -327,7 +335,7 @@ exit 1
 	}
 
 	// Argo v3.5+ 需要设置 Parallelism
-	parallelism := intstr.FromInt(50)
+	parallelism := int64(50) // 修复：使用 int64 而不是 IntOrString
 	argoWF.Spec.Parallelism = &parallelism
 
 	return argoWF, nil
